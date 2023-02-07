@@ -26,7 +26,7 @@ Install dependencies:
 Install `s-nomp`:
 1. `git clone https://github.com/ZcashFoundation/s-nomp`
 2. `cd s-nomp`
-3. Use the Zebra configs: `git checkout zebra-mining`
+3. Use the Zebra configs: `git checkout -t origin/zebra-mining`
     * TODO: change the fork in `package.json` to ZcashFoundation
 4. Use node 8.17.0:
 ```sh
