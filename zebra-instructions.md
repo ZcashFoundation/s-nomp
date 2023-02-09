@@ -8,12 +8,7 @@ These fixes disable mining pool operator payments and miner payments: they just 
 
 ## Install, run, and sync Zebra
 
-1. [Build Zebra](https://github.com/ZcashFoundation/zebra#build-instructions)
-   Zebra will need to be compiled with the `getblocktemplate-rpcs` feature:
-    ```sh
-    cargo build --release --features "getblocktemplate-rpcs"
-    ```
-2. Configure `zebrad.toml`:
+1. Configure `zebrad.toml`:
     * change the `network.network` config to `Testnet`
     * add your testnet transparent address in `mining.miner_address`, or you can use the ZF testnet address `t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v`
     * ensure that there is an `rpc.listen_addr` in the config to enable the RPC server
@@ -75,11 +70,11 @@ These fixes disable mining pool operator payments and miner payments: they just 
     miner_address = 't27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v'
     ```
     </details>
-3. [Run Zebra](https://zebra.zfnd.org/user/run.html) with the `getblocktemplate-rpcs` feature:
+2. [Build](https://github.com/ZcashFoundation/zebra#build-instructions) and [Run Zebra](https://zebra.zfnd.org/user/run.html) with the `getblocktemplate-rpcs` feature:
     ```sh
-    cargo run --release --features "getblocktemplate-rpcs"
+    cargo run --release --features "getblocktemplate-rpcs" --bin zebrad -- -c zebrad.toml
     ```
-4. Wait a few hours for Zebra to sync to the testnet tip (on mainnet this takes 2-3 days)
+3. Wait a few hours for Zebra to sync to the testnet tip (on mainnet this takes 2-3 days)
 
 ## Install and run a mining pool
 
