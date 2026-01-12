@@ -58,6 +58,9 @@ cat > /app/config.json << EOF
 }
 EOF
 
+# Remove any existing pool configs to avoid conflicts
+rm -f /app/pool_configs/*.json
+
 # Generate pool config
 cat > /app/pool_configs/zcash.json << EOF
 {
