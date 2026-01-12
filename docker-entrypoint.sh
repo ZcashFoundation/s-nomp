@@ -7,12 +7,15 @@ ZEBRA_RPC_PORT="${ZEBRA_RPC_PORT:-18232}"
 REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
 STRATUM_PORT="${STRATUM_PORT:-3333}"
 NETWORK="${NETWORK:-Testnet}"
+POOL_ADDRESS="${POOL_ADDRESS:-}"
 
-# Select coin file based on network
+# Select coin file and default pool address based on network
 if [ "$NETWORK" = "Mainnet" ]; then
     COIN_FILE="zec.json"
+    POOL_ADDRESS="${POOL_ADDRESS:-t1fgGy3CBkKJax8EH1RquQdPGPXPnDH5ig6}"
 else
     COIN_FILE="testnet/zec.json"
+    POOL_ADDRESS="${POOL_ADDRESS:-tmRGc4CD1UyUdbSJmTUzcB6oDqk4qUaHnnh}"
 fi
 
 # Generate config.json
@@ -66,7 +69,7 @@ cat > /app/pool_configs/zcash.json << EOF
 {
     "enabled": true,
     "coin": "${COIN_FILE}",
-    "address": "tmRGc4CD1UyUdbSJmTUzcB6oDqk4qUaHnnh",
+    "address": "${POOL_ADDRESS}",
     "_comment_address": "Ignored - all rewards go to Zebra miner_address",
     "paymentProcessing": {
         "enabled": false,
