@@ -1,0 +1,79 @@
+# S-NOMP on Arch Linux
+#
+# Build: docker build -f Dockerfile.arch -t s-nomp-arch .
+# Run:   docker run --rm -v $(pwd)/config.json:/app/config.json -p 3333:3333 -p 8080:8080 s-nomp-arch
+#
+# Workarounds applied:
+# - Python 3.10 via pyenv (node-gyp 5.x incompatible with Python 3.11+)
+# - Dummy libboost_system.so (header-only in modern Boost but old binding.gyp links it)
+# - Node 10.24.1 (equihashverify V8 API incompatible with Node 12+)
+
+FROM archlinux:latest
+
+# Update system and install build dependencies
+RUN pacman -Syu --noconfirm && \
+    pacman -S --noconfirm --needed \
+        make \
+        gcc \
+        boost \
+        libsodium \
+        git \
+        gmp \
+        redis \
+        npm \
+        pyenv
+
+# Install Python 3.10 via pyenv (compatible with old node-gyp)
+ENV PYENV_ROOT="/root/.pyenv"
+ENV PATH="${PYENV_ROOT}/shims:${PYENV_ROOT}/bin:${PATH}"
+RUN pyenv install 3.10 && pyenv global 3.10
+
+# Create dummy libboost_system (it's header-only in modern Boost but old binding.gyp needs it)
+RUN echo 'void boost_system_dummy() {}' > /tmp/boost_system.c && \
+    gcc -shared -fPIC -o /usr/lib/libboost_system.so /tmp/boost_system.c && \
+    rm /tmp/boost_system.c
+
+# Install n (Node version manager) and Node 10
+RUN npm install -g n && n 10.24.1
+
+# Ensure /usr/local/bin is first in PATH (Node 10's npm)
+ENV PATH="/usr/local/bin:${PATH}"
+
+# Set up app directory
+WORKDIR /app
+
+# Copy package files first for better caching
+COPY package*.json ./
+
+# Set compiler flags for modern GCC compatibility
+ENV CXXFLAGS="-std=gnu++17"
+
+# Install dependencies
+RUN npm update && npm install
+
+# Patch stratum-pool daemon.js for Zebra compatibility:
+# 1. Add Content-Type header
+# 2. Add jsonrpc: "2.0" to batch requests
+# 3. Add jsonrpc: "2.0" to single requests
+RUN sed -i "s/'Content-Length': jsonData.length/'Content-Length': jsonData.length,\n                'Content-Type': 'application\/json'/" \
+    /app/node_modules/stratum-pool/lib/daemon.js && \
+    sed -i 's/requestJson.push({/requestJson.push({ jsonrpc: "2.0",/' \
+    /app/node_modules/stratum-pool/lib/daemon.js && \
+    sed -i 's/var requestJson = JSON.stringify({/var requestJson = JSON.stringify({ jsonrpc: "2.0",/' \
+    /app/node_modules/stratum-pool/lib/daemon.js
+
+# Copy the rest of the application
+COPY . .
+
+# Set library path for equihashverify native module
+ENV LD_LIBRARY_PATH="/app/node_modules/stratum-pool/node_modules/equihashverify/build/Release:/app/node_modules/equihashverify/build/Release"
+
+# Copy and setup entrypoint
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Expose ports (stratum default 3333, web 8080)
+EXPOSE 3333 8080
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["node", "init.js"]
