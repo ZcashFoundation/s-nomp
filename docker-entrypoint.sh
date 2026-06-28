@@ -21,6 +21,7 @@ fi
 # Generate config.json
 cat > /app/config.json << EOF
 {
+    "switching": {},
     "logLevel": "debug",
     "logColors": true,
     "cliPort": 17117,
@@ -82,6 +83,7 @@ cat > /app/pool_configs/zcash.json << EOF
     },
     "ports": {
         "${STRATUM_PORT}": {
+            "tls": false,
             "diff": 0.05,
             "varDiff": {
                 "minDiff": 0.04,
