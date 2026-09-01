@@ -48,7 +48,7 @@
         "nonce": "^1.0.4",
         "redis": "^2.8.0",
         "request": "^2.88.2",
-        "stratum-pool": "git+https://github.com/upbqdn/node-stratum-pool.git"
+        "stratum-pool": "git+https://github.com/upbqdn/node-stratum-pool.git#4eaf3b596b0c9375430e777a2b0750ec885a344d"
     },
     "engines": {
         "node": ">=8.11"

@@ -13,6 +13,11 @@ POOL_ADDRESS="${POOL_ADDRESS:-}"
 if [ "$NETWORK" = "Mainnet" ]; then
     COIN_FILE="zec.json"
     POOL_ADDRESS="${POOL_ADDRESS:-t1fgGy3CBkKJax8EH1RquQdPGPXPnDH5ig6}"
+elif [ "$NETWORK" = "Regtest" ]; then
+    # Regtest runs Equihash (48, 5), so it needs its own coin file. It shares Testnet's address
+    # prefixes.
+    COIN_FILE="regtest/zec.json"
+    POOL_ADDRESS="${POOL_ADDRESS:-tmRGc4CD1UyUdbSJmTUzcB6oDqk4qUaHnnh}"
 else
     COIN_FILE="testnet/zec.json"
     POOL_ADDRESS="${POOL_ADDRESS:-tmRGc4CD1UyUdbSJmTUzcB6oDqk4qUaHnnh}"
