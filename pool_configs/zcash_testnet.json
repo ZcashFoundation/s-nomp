@@ -3,7 +3,7 @@
     "coin": "testnet/zec.json",
 
     "address": "tmRGc4CD1UyUdbSJmTUzcB6oDqk4qUaHnnh",
-    "_comment_address": "This address is currently ignored, but it must be a P2PKH address. generated using zcash-cli -testnet getnewaddress. A transparent address to send coinbase rewards to and to transfer to zAddress.",
+    "_comment_address": "Legacy pool identity only; set the real pool payout in Zebra [mining].miner_address.",
 
     "zAddress": "",
     "_comment_zAddress": "a private address used to send coins to tAddress.",
@@ -17,9 +17,7 @@
     "walletInterval": 100000,
     "_comment_walletInterval": "Used to cache coin stats",
 
-    "rewardRecipients": {
-        "": 0.2
-    },
+    "rewardRecipients": {},
 
     "paymentProcessing": {
         "enabled": false,
