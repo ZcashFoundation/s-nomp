@@ -3,14 +3,17 @@
 ## Important
 
 This Zebra fork mines the daemon's `coinbasetxn` unchanged, including NU6.3 v6
-transactions. **Set the pool's actual payout address in Zebra's `[mining]
-miner_address`.** The s-nomp `address` is a legacy pool identity, not a payout
-override. Operator/miner payment distribution remains disabled.
+transactions. **Set the pool's actual reward address in Zebra's `[mining]
+miner_address`.** The s-nomp `address` remains a transparent legacy pool identity,
+not a coinbase override.
 
-Nonempty `rewardRecipients`, nonempty `poolHex`, and enabled `paymentProcessing`
-are rejected rather than silently ignored. Configure coinbase text at the daemon,
-not the pool. See [the NU6.3 Regtest guide](#mine-on-nu63-regtest-with-zallet-payouts)
-below for the required branches; the older public-testnet setup follows first.
+Nonempty `rewardRecipients` and `poolHex` are rejected rather than silently
+ignored. Configure coinbase text at the daemon, not the pool. Miner distribution
+can use the [Zallet payment adapter](#zallet-payment-adapter); the matching
+stratum-pool branch permits `paymentProcessing.wallet = "zallet"`. Legacy zcashd
+payment processing remains available with the legacy pool implementation.
+See [the NU6.3 Regtest guide](#mine-on-nu63-regtest-with-zallet-payouts) below for
+the required branches; the older public-testnet setup follows first.
 
 ## Install, run, and sync Zebra
 
@@ -579,6 +582,111 @@ MINER_PID=$!
 
 Capture its PID for `kill -STOP "$MINER_PID"` / `kill -CONT "$MINER_PID"` in the
 funded phase. Do not use process-name-wide kill commands.
+
+### Zallet payment adapter
+
+The mining-only configuration above deliberately disables payments. To distribute
+real rewards, keep `daemons[]` pointed at Zebra and replace `paymentProcessing`
+with the following settings (substitute real addresses, UUID and credentials):
+
+```json
+{
+  "enabled": true,
+  "wallet": "zallet",
+  "account": "POOL_ACCOUNT_UUID",
+  "address": "POOL_SHIELDED_MINER_ADDRESS",
+  "minConf": 100,
+  "minimumPayment": 0.001,
+  "paymentInterval": 30,
+  "maxBlocksPerPayment": 3,
+  "daemon": {
+    "host": "127.0.0.1",
+    "port": 28334,
+    "user": "ZALLET_RPC_USER",
+    "password": "ZALLET_RPC_PASSWORD"
+  }
+}
+```
+
+- `paymentProcessing.address` must be the **same shielded address** as Zebra's
+  `mining.miner_address`, belonging to `paymentProcessing.account`. For NU6.3 use
+  an Orchard-only UA from `z_getaddressforaccount UUID ["orchard"]`; Zebra pays
+  its receiver in Ironwood. A Sapling address/UA is also supported. Do not use a
+  bare transparent coinbase address: Zallet's `z_sendmany` excludes transparent
+  coinbase UTXOs, and this adapter never calls `z_shieldcoinbase`.
+- Top-level `address` stays a valid transparent identity for Stratum initialization.
+  It does not control the reward destination. Miner usernames identify the
+  recipients, not the pool account. Use two **separate recipient accounts** for
+  the e2e run; do not reuse the pool account. Transparent recipients are supported.
+  The adapter also accepts complete shielded addresses without the old address-length
+  fallback; those usernames need the existing `validateWorkerUsername: false`
+  because the mining daemon's legacy `validateaddress` checks transparent addresses.
+- Supply Zallet's authenticated RPC username/password, for example the two fields
+  from its current `.cookie`. Restart the pool with fresh credentials after a
+  cookie change. Account/address ownership is checked at startup; wallet synchronization
+  is checked during each payment cycle, so a fresh wallet can catch up while mining.
+  Unlock its seed before payouts. The adapter sends JSON-RPC 2.0 over HTTP with a
+  60-second request timeout. Keep this endpoint on the isolated trusted network.
+- `minConf` gates both account spendability and reward classification.
+  Rewards need at least `max(100, minConf, coin.poolOptions.confirmations || 100)`
+  confirmations. `minimumPayment`, `maxBlocksPerPayment`, share weighting/PPLNT,
+  and the existing per-round `coin.txfee` reserve are unchanged. `paymentInterval`
+  retains its existing 30-second lower bound. The first cycle starts after that
+  interval; an in-progress Zallet cycle is never overlapped.
+- `coin.txfee` is an accounting reserve, **not a Zallet fee override**. Zallet
+  calculates its actual fee internally. Reserve enough for the recipient/input
+  count; the adapter checks spendable funds plus one reserve before sending.
+  It never reduces miner rewards and resubmits after a failed/ambiguous Zallet send.
+
+Required wallet RPC contract (implemented in Zallet's
+`zallet-core/src/components/json_rpc/methods/`):
+
+| RPC | Parameters and consumed result |
+| --- | --- |
+| `z_getaccount` | `[account UUID]`; `account_uuid`, `addresses[].ua` or `.sapling` prove that the configured source belongs to the pool account. |
+| `z_listunifiedreceivers` | `[source UA]`; `orchard` is a single-receiver UA and `sapling` a Sapling address. Match the receiver Zebra actually selects, not all coinbase outputs. |
+| `z_getbalanceforaccount` | `[account UUID, minConf]`; sum integer `pools.<pool>.valueZat` for the source address's shielded pools only. Zero pools are omitted. Never read/spend another account's balance or use `ANY_TADDR`. |
+| `z_viewtransaction` | `[coinbase txid]`; require `generated: true`, `status: "mined"`, the recorded `blockhash`, and integer `confirmations`. Sum only `outputs[]` with the pool UUID, actual receiver address, `outgoing: false`, `walletInternal: false`, and integer `valueZat`. Missing/unsynced transactions hold the cycle instead of being kicked as invalid. |
+| `z_sendmany` | `[source address, [{"address": recipient, "amount": ZEC}], minConf, null, "NoPrivacy"]`; returns an `opid-UUID`, not a txid. The address scopes selection to the verified pool account; its receiver types scope the spendable pools. `NoPrivacy` explicitly permits transparent recipients and cross-pool amounts. |
+| `z_getoperationstatus` | `[[opid]]` every five seconds; queued/executing retain the same cycle. Only success with `result.broadcast: true` and a nonempty `result.txids[]` completes the send. All txids are saved in the existing `:payments` record; its legacy `txid` is the last transaction ID. |
+
+The processor reuses the existing Redis shares, round rewards, balances, payouts,
+confirmed-block movement and payment-history transaction. It does not create a
+second payout calculation. A payment is recorded after broadcast success, not
+after confirmation: separately verify inclusion and recipient receipt in a
+subsequent pool-found block.
+
+Before sending, Redis `COIN:paymentProcessing:pending` is acquired with `SETNX`
+and **no expiry**. It records the account/address, exact amounts, worker/round
+snapshot, then operation ID, successful result, and final accounting commands.
+It is deleted only after every accounting command succeeds. A failed/cancelled
+operation, missing result, RPC error, one-hour operation deadline, `broadcast:
+false`, Redis failure, or restart with this journal stops further processing
+without resending. Failed or ambiguous sends never reach payout accounting.
+Failed multi-transaction operations may already have broadcast a prefix, so even
+explicit failures are not automatically retried. Operation results are not
+consumed with `z_getoperationresult`.
+
+**Recovery is intentionally fail-closed:** stop the payment processor, preserve
+the journal, inspect its operation/transaction IDs and actual wallet/chain state,
+and reconcile the recorded commands against Redis before clearing the fence.
+Never blindly replay accounting commands or delete the key: an EXEC reply can
+be lost after the commands ran, and Redis EXEC does not roll back per-command
+errors. If the send response was lost before its opid was saved, inspect Zallet's
+operation history and outgoing transactions for the recorded amounts/source.
+Zallet's in-memory operation history can disappear on wallet restart. Maintain
+durable Redis storage for real funds; the disposable no-persistence Redis command
+above is only for isolated Regtest use.
+
+For deterministic e2e accounting, initially use `minConf: 1000000` while both real
+miners earn rounds, then freeze mining, snapshot Redis, restart s-nomp with
+`minConf: 100`, and drain mature rounds. Observe `Zallet payment cycle completed`
+after the successful payment and again on the next complete frozen-height cycle;
+this marker excludes failed cycles. Assert unchanged paid totals and no second
+`z_sendmany`. Resume mining only then and verify recipient balances and payout
+inclusion. Keep the wallet's `external.broadcast` enabled. Check wallet
+synchronization, proving, address-encoding agreement, and actual recipient receipt;
+a successful RPC operation alone is not proof of a completed payout.
 
 ### Acceptance observations
 
