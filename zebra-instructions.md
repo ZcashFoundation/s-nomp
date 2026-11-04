@@ -266,8 +266,9 @@ demonstrate successful mining or payouts.
 ### Source requirements
 
 - [s-nomp](https://github.com/ZcashFoundation/s-nomp), branch `feat/ironwood-nu6.3`.
-- [stratum-pool](https://github.com/upbqdn/node-stratum-pool), branch
-  `feat/ironwood-nu6.3`, including daemon-owned coinbases and external payments.
+- [stratum-pool](https://github.com/upbqdn/node-stratum-pool), revision
+  `1f0726f5c3e3b0652a6e0ca0f9abb127c4828dcd`, including daemon-owned coinbases,
+  external payments, long polling, and same-parent job updates.
 - [Zebra](https://github.com/ZcashFoundation/zebra), built from `main` with NU6.3
   Regtest activation, v6 block templates, and Ironwood coinbase support.
 - [Zallet](https://github.com/zcash/wallet), with the zaino backend, NU6.3 Regtest
@@ -291,6 +292,7 @@ export ZALLET_SRC="$SRC_ROOT/wallet"
 export MINER_SRC="$SRC_ROOT/nheqminer"
 git clone --branch feat/ironwood-nu6.3 https://github.com/ZcashFoundation/s-nomp "$SNOMP_SRC"
 git clone --branch feat/ironwood-nu6.3 https://github.com/upbqdn/node-stratum-pool "$STRATUM_SRC"
+git -C "$STRATUM_SRC" checkout 1f0726f5c3e3b0652a6e0ca0f9abb127c4828dcd
 git clone --branch main https://github.com/ZcashFoundation/zebra "$ZEBRA_SRC"
 git clone https://github.com/zcash/wallet "$ZALLET_SRC"
 git -C "$ZALLET_SRC" checkout "$ZALLET_REF"
@@ -348,14 +350,14 @@ npm install --unsafe-perm --no-save --package-lock=false "$STRATUM_SRC"
 node -p 'require.resolve("stratum-pool")'
 ```
 
-The final path must resolve to the selected stratum-pool branch (or its
-npm-installed copy), not the dependency pinned by the original s-nomp lockfile.
+The final path must resolve to the pinned stratum-pool revision (or its
+npm-installed copy), not another branch or a previously installed dependency.
 Alternatively, install it directly from GitHub:
 
 ```sh
 cd "$SNOMP_SRC"
 npm install --unsafe-perm --no-save --package-lock=false \
-  github:upbqdn/node-stratum-pool#feat/ironwood-nu6.3
+  github:upbqdn/node-stratum-pool#1f0726f5c3e3b0652a6e0ca0f9abb127c4828dcd
 ```
 
 These explicit installs leave the tracked dependency declaration and lockfile
@@ -548,6 +550,7 @@ config.cliPort = 28339;
 config.redis = {host: '127.0.0.1', port: 28379};
 Object.assign(config.defaultPoolConfigs, {
   redis: config.redis, blockRefreshInterval: 250, jobRebroadcastTimeout: 30,
+  longPollRefreshInterval: 60000, cleanJobsOnTemplateUpdate: true,
   validateWorkerUsername: false, poolHex: '', banning: {enabled: false}
 });
 fs.writeFileSync('config.json', JSON.stringify(config, null, 2) + '\n');
@@ -565,9 +568,15 @@ npm start
 ```
 
 The **actual payout remains `$MINER_ADDRESS` in zebrad.toml**, not the pool JSON.
-No variable difficulty is configured. A 30-second rebroadcast interval limits
-nonce-search resets. Stratum binds all interfaces in this implementation:
-isolate/firewall its port; do not expose this test pool.
+Long polling forwards changed templates without waiting for the 30-second idle
+rebroadcast. The 250 ms polling interval remains a backstop, slowed to 60 seconds
+while long polling is healthy. Unmodified nheqminer ignores non-clean jobs, so
+`cleanJobsOnTemplateUpdate` sends same-parent updates with `clean_jobs=true`;
+the server still accepts shares for its newest 32 jobs on the current parent.
+Idle rebroadcasts request a fresh template timestamp; unchanged work keeps its
+current job ID, duplicate-share history, and a non-clean notification.
+No variable difficulty is configured. Stratum binds all interfaces in this
+implementation: isolate/firewall its port; do not expose this test pool.
 
 Build the Zcash Foundation `nheqminer` CPU miner from the clone above:
 
@@ -712,9 +721,9 @@ a successful RPC operation alone is not proof of a completed payout.
    Require v6 for the Ironwood transaction, nonempty `ironwood.actions`, and a
    nonempty `orchard.actions` in the migration transaction. Retain raw bytes and
    decoded JSON. Check both txids occur in GBT `transactions[].hash` with fees.
-3. Run the capture-based serialization test above, and wait for a Stratum job
-   whose Merkle root equals the captured GBT root in serialized order. Same-parent
-   transaction refresh can wait until the 30-second rebroadcast.
+3. Run the capture-based serialization test above, and require a same-parent
+   Stratum job whose Merkle root equals the captured GBT root in serialized order,
+   without waiting for the idle rebroadcast. Record the job's ID and clean flag.
 4. Resume the CPU miner. Require Zebra's successful `submitblock` result plus block
    lookup on A and native-P2P visibility on B. The accepted funded block must
    include **both** transaction IDs. Its coinbase/body order must match one captured
