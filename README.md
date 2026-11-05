@@ -84,6 +84,34 @@ Whenever a miner submits a share, the pool counts the difficulty and keeps addin
 ie: Miner 1 mines at 0.1 difficulty and finds 10 shares, the pool sees it as 1 share. Miner 2 mines at 0.5 difficulty and finds 5 shares, the pool sees it as 2.5 shares. 
 ```
 
+##### Optional wallet-sidecar payments
+
+Payments remain disabled in the supplied Zebra pool configuration. For an experimental
+wallet-sidecar setup, keep `daemons` pointed at Zebra and set `paymentProcessing.daemon`
+to the wallet's authenticated RPC endpoint. Enable `paymentProcessing.enabled`, use a coin
+configuration with `requireShielding: true`, and configure wallet-owned `address` (coinbase),
+`zAddress` (Sapling), and a distinct `tAddress` (transparent payout funds).
+Use the same coinbase address in Zebra's `mining.miner_address`.
+
+Set the coin's `txfee` in ZEC (default `0.0004`), `paymentProcessing.minConf` (default `10`),
+and `walletInterval` in minutes. The fee budget is deducted once per block from miner rewards;
+it must cover shielding, unshielding, and the final transparent payout. For one coinbase input,
+one Sapling note, and one miner, ZIP 317 fees are `0.00015 + 0.00015 + 0.0001 = 0.0004` ZEC.
+The processor reserves and passes only `0.00015` ZEC for unshielding, with the confirmation
+count and explicit `AllowRevealedRecipients` privacy policy. The recipient and amount are public.
+Shielded balances at or below that unshielding fee are not sent. More than two Sapling spends
+require changing the explicit unshielding fee as well as sizing the per-block budget; raising
+`txfee` or the wallet's default fee alone does not raise this fixed transfer fee.
+Completed shielding is tracked by its string `opid`, releasing the next transfer.
+
+The processor needs `getbalance`, `listunspent`, `sendmany`, `validateaddress`, `gettransaction`,
+`getblock`, `getmininginfo`, `getnetworkinfo`, `z_validateaddress`, `z_shieldcoinbase`,
+`z_getbalance`, `z_sendmany`, `z_getoperationstatus`, and `z_getoperationresult`. It also queries
+`getaccount` but tolerates its absence. Zebra itself does not provide wallet RPCs.
+
+Run `npm test` for callback-flow regression checks; no installed dependencies, wallet,
+Redis server, or network access are required.
+
 
 ##### [Optional, recommended] Setting up blocknotify
 1. In `config.json` set the port and password for `blockNotifyListener`
