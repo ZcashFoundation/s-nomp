@@ -51,6 +51,7 @@ function SetupForPool(logger, poolOptions, setupFinished){
 
     var coin = poolOptions.coin.name;
     var processingConfig = poolOptions.paymentProcessing;
+    var useZallet = processingConfig.wallet === 'zallet';
 
     var logSystem = 'Payments';
     var logComponent = coin;
@@ -78,7 +79,8 @@ function SetupForPool(logger, poolOptions, setupFinished){
     var pplntTimeQualify = processingConfig.pplnt || 0.51; // 51%
 
     var getMarketStats = poolOptions.coin.getMarketStats === true;
-    var requireShielding = poolOptions.coin.requireShielding === true;
+    // Zebra already constructs the shielded coinbase; Zallet never runs the legacy sweep.
+    var requireShielding = !useZallet && poolOptions.coin.requireShielding === true;
     var fee = parseFloat(poolOptions.coin.txfee) || parseFloat(0.0004);
 
     logger.debug(logSystem, logComponent, logComponent + ' requireShielding: ' + requireShielding);
@@ -90,6 +92,9 @@ function SetupForPool(logger, poolOptions, setupFinished){
     var daemon = new Stratum.daemon.interface([processingConfig.daemon], function(severity, message){
         logger[severity](logSystem, logComponent, message);
     });
+    var miningDaemon = useZallet ? new Stratum.daemon.interface([poolOptions.daemons[0]], function(severity, message){
+        logger[severity](logSystem, logComponent, message);
+    }) : daemon;
     var redisClient = CreateRedisClient(poolOptions.redis);
     // redis auth if enabled
     if (poolOptions.redis.password) {
@@ -101,6 +106,174 @@ function SetupForPool(logger, poolOptions, setupFinished){
     var coinPrecision;
 
     var paymentInterval;
+    var paymentRunning = false;
+    var pendingPayment;
+    var pendingPaymentKey = coin + ':paymentProcessing:pending';
+    var rewardAddress;
+    var spendPools;
+
+    // Zallet requires JSON-RPC 2.0. Keep the legacy daemon transport for zcashd.
+    function walletRpc(method, params, callback) {
+        var rpc = processingConfig.daemon;
+        request.post({
+            url: require('url').format({protocol: 'http:', hostname: rpc.host || '127.0.0.1', port: rpc.port, pathname: '/'}),
+            auth: {user: rpc.user, pass: rpc.password},
+            json: {jsonrpc: '2.0', id: 1, method: method, params: params},
+            followRedirect: false,
+            timeout: 60000
+        }, function(error, response, body) {
+            if (error || !response || response.statusCode !== 200 || !body ||
+                body.id !== 1 || body.error || !Object.prototype.hasOwnProperty.call(body, 'result')) {
+                return callback(new Error(method + ': ' + (error ? error.message : JSON.stringify(body))));
+            }
+            callback(null, body.result);
+        });
+    }
+
+    function zalletBalance(callback) {
+        walletRpc('z_getbalanceforaccount', [processingConfig.account, minConfPayout], function(error, balance) {
+            if (error) return callback(error);
+            if (!balance || !balance.pools || balance.minimum_confirmations !== minConfPayout)
+                return callback(new Error('Invalid Zallet account balance'));
+            var total = 0;
+            for (var i = 0; i < spendPools.length; i++) {
+                var pool = balance.pools[spendPools[i]];
+                if (!pool) continue; // Zallet omits zero balances.
+                if (!Number.isSafeInteger(pool.valueZat) || pool.valueZat < 0)
+                    return callback(new Error('Invalid Zallet valueZat'));
+                total += pool.valueZat;
+            }
+            if (!Number.isSafeInteger(total)) return callback(new Error('Zallet balance overflow'));
+            callback(null, total);
+        });
+    }
+
+    function setupZallet(callback) {
+        magnitude = 100000000;
+        coinPrecision = 8;
+        minPaymentSatoshis = Math.round(processingConfig.minimumPayment * magnitude);
+        if (typeof processingConfig.account !== 'string' || !processingConfig.address ||
+            !Number.isSafeInteger(minPaymentSatoshis) || minPaymentSatoshis <= 0 ||
+            !Number.isInteger(minConfPayout) || !Number.isInteger(maxBlocksPerPayment) ||
+            !Number.isFinite(fee) || fee <= 0) {
+            return callback(new Error('Zallet requires account UUID, address, and positive payment settings'));
+        }
+        walletRpc('z_getaccount', [processingConfig.account], function(error, account) {
+            if (error) return callback(error);
+            if (!account || account.account_uuid !== processingConfig.account || !Array.isArray(account.addresses))
+                return callback(new Error('Zallet account UUID mismatch'));
+            var address = processingConfig.address;
+            var known = account.addresses.find(function(a) { return a.ua === address || a.sapling === address; });
+            if (!known)
+                return callback(new Error('paymentProcessing.address must be a shielded address of the pool account'));
+            if (known.sapling === address) {
+                rewardAddress = address;
+                spendPools = ['sapling'];
+                return callback();
+            }
+            walletRpc('z_listunifiedreceivers', [address], function(error, receivers) {
+                if (error) return callback(error);
+                if (!receivers || (!receivers.orchard && !receivers.sapling))
+                    return callback(new Error('Pool Unified Address has no shielded receiver'));
+                // Zebra prefers Orchard receivers (Ironwood after NU6.3), then Sapling.
+                rewardAddress = receivers.orchard || receivers.sapling;
+                spendPools = receivers.orchard ? ['orchard', 'ironwood'] : [];
+                if (receivers.sapling) spendPools.push('sapling');
+                callback();
+            });
+        });
+    }
+
+    function zalletTransactions(rounds, callback) {
+        async.mapLimit(rounds, 4, function(round, next) {
+            walletRpc('z_viewtransaction', [round.txHash], function(error, tx) {
+                if (error) return next(error); // Wallet lag is not evidence of an invalid block.
+                if (!tx || tx.txid !== round.txHash || tx.generated !== true ||
+                    !Number.isInteger(tx.confirmations) || !Array.isArray(tx.outputs))
+                    return next(new Error('Invalid Zallet coinbase details for ' + round.txHash));
+                if (tx.status !== 'mined' || tx.blockhash !== round.blockHash)
+                    return next(new Error('Coinbase not in the wallet main chain: ' + round.txHash));
+                var reward = 0;
+                tx.outputs.forEach(function(output) {
+                    if (output.account_uuid === processingConfig.account && output.address === rewardAddress &&
+                        output.outgoing === false && output.walletInternal === false) {
+                        reward += Number.isSafeInteger(output.valueZat) && output.valueZat >= 0 ? output.valueZat : NaN;
+                    }
+                });
+                if (!Number.isSafeInteger(reward) || reward <= coinsToSatoshies(fee))
+                    return next(new Error('Missing or invalid reward to the configured pool address: ' + round.txHash));
+                var confirmations = Math.max(100, minConfPayout,
+                    (poolOptions.coin.poolOptions || {}).confirmations || 100);
+                next(null, {result: {
+                    confirmations: tx.confirmations,
+                    details: [{address: poolOptions.address, amount: satoshisToCoins(reward),
+                        category: tx.confirmations >= confirmations ? 'generate' : 'immature'}]
+                }});
+            });
+        }, function(error, results) {
+            // Preserve the existing round/account callback shape without calling getaccount.
+            callback(error, error ? null : results.concat([{result: ''}]));
+        });
+    }
+
+    function savePendingPayment(callback) {
+        redisClient.set(pendingPaymentKey, JSON.stringify(pendingPayment), callback);
+    }
+
+    function stopZalletPayments(error, callback) {
+        clearInterval(paymentInterval);
+        logger.error(logSystem, logComponent, 'Zallet payments stopped: ' + error.message +
+            '. Reconcile ' + pendingPaymentKey + ' before restarting; never blindly delete a pending send.');
+        callback(error);
+    }
+
+    function sendZallet(addressAmounts, workers, rounds, callback) {
+        pendingPayment = {account: processingConfig.account, address: processingConfig.address,
+            amounts: addressAmounts, workers: workers, rounds: rounds, created: Date.now()};
+        // No expiry: losing the send response or restarting must never permit a second send.
+        redisClient.setnx(pendingPaymentKey, JSON.stringify(pendingPayment), function(error, acquired) {
+            if (error || acquired !== 1)
+                return stopZalletPayments(error || new Error('Unreconciled payment already exists'), callback);
+            var amounts = Object.keys(addressAmounts).map(function(address) {
+                return {address: address, amount: addressAmounts[address]};
+            });
+            walletRpc('z_sendmany', [processingConfig.address, amounts, minConfPayout, null, 'NoPrivacy'],
+                function(error, opid) {
+                    if (error || typeof opid !== 'string' || !/^opid-[0-9a-f-]{36}$/.test(opid))
+                        return stopZalletPayments(error || new Error('Missing Zallet operation id'), callback);
+                    pendingPayment.opid = opid;
+                    savePendingPayment(function(error) {
+                        if (error) return stopZalletPayments(error, callback);
+                        poll();
+                    });
+                });
+            function poll() {
+                walletRpc('z_getoperationstatus', [[pendingPayment.opid]], function(error, operations) {
+                    if (error) return stopZalletPayments(error, callback);
+                    if (!Array.isArray(operations) || operations.length !== 1 || operations[0].id !== pendingPayment.opid)
+                        return stopZalletPayments(new Error('Missing Zallet operation status'), callback);
+                    var operation = operations[0];
+                    if (operation.status === 'queued' || operation.status === 'executing') {
+                        if (Date.now() - pendingPayment.created >= 3600000)
+                            return stopZalletPayments(new Error('Zallet operation exceeded one hour'), callback);
+                        return setTimeout(poll, 5000);
+                    }
+                    var result = operation.result;
+                    if (operation.status !== 'success' || !result || result.broadcast !== true ||
+                        !Array.isArray(result.txids) || result.txids.length === 0 ||
+                        !result.txids.every(function(txid) { return typeof txid === 'string' && /^[0-9a-f]{64}$/.test(txid); })) {
+                        // A failed multi-transaction operation can already have broadcast a prefix.
+                        return stopZalletPayments(new Error('Unconfirmed Zallet send outcome: ' + JSON.stringify(operation)), callback);
+                    }
+                    pendingPayment.result = result;
+                    savePendingPayment(function(error) {
+                        if (error) return stopZalletPayments(error, callback);
+                        callback(null, {response: result.txids[result.txids.length - 1], txids: result.txids});
+                    });
+                });
+            }
+        });
+    }
 
     function validateAddress (callback){
         daemon.cmd('validateaddress', [poolOptions.address], function(result) {
@@ -174,6 +347,7 @@ function SetupForPool(logger, poolOptions, setupFinished){
 
     function asyncComplete(err){
         if (err){
+            if (useZallet) logger.error(logSystem, logComponent, 'Zallet setup failed: ' + err.message);
             setupFinished(false);
             return;
         }
@@ -185,7 +359,9 @@ function SetupForPool(logger, poolOptions, setupFinished){
         setupFinished(true);
     }
 
-    if (requireShielding === true) {
+    if (useZallet) {
+        setupZallet(asyncComplete);
+    } else if (requireShielding === true) {
         async.parallel([validateAddress, validateTAddress, validateZAddress, getBalance], asyncComplete);
     } else {
         async.parallel([validateAddress, validateTAddress, getBalance], asyncComplete);
@@ -193,6 +369,7 @@ function SetupForPool(logger, poolOptions, setupFinished){
 
     //get t_address coinbalance
     function listUnspent (addr, notAddr, minConf, displayBool, callback) {
+        if (useZallet) return zalletBalance(callback);
         if (addr !== null) {
             var args = [minConf, 99999999, [addr]];
         } else {
@@ -357,7 +534,7 @@ function SetupForPool(logger, poolOptions, setupFinished){
 
     function cacheNetworkStats () {
         var params = null;
-        daemon.cmd('getmininginfo', params,
+        miningDaemon.cmd('getmininginfo', params,
             function (result) {
                 if (!result || result.error || result[0].error || !result[0].response) {
                     logger.error(logSystem, logComponent, 'Error with RPC call getmininginfo '+JSON.stringify(result[0].error));
@@ -377,7 +554,7 @@ function SetupForPool(logger, poolOptions, setupFinished){
                     finalRedisCommands.push(['hset', coin + ':stats', 'networkSols', result[0].response.networkhashps]);
                 }
 
-                daemon.cmd('getnetworkinfo', params,
+                miningDaemon.cmd('getnetworkinfo', params,
                     function (result) {
                         if (!result || result.error || result[0].error || !result[0].response) {
                             logger.error(logSystem, logComponent, 'Error with RPC call getnetworkinfo '+JSON.stringify(result[0].error));
@@ -576,8 +753,11 @@ function SetupForPool(logger, poolOptions, setupFinished){
        when rounding and whatnot. When we are storing numbers for only humans to see, store in whole coin units. */
 
     var processPayments = function(){
+        if (useZallet && paymentRunning) return;
+        if (useZallet) paymentRunning = true;
 
         var startPaymentProcess = Date.now();
+        var availableFunds;
 
         var timeSpentRPC = 0;
         var timeSpentRedis = 0;
@@ -592,6 +772,14 @@ function SetupForPool(logger, poolOptions, setupFinished){
         var endRPCTimer = function(){ timeSpentRPC += Date.now() - startTimeRedis };
 
         async.waterfall([
+            function(callback) {
+                if (!useZallet) return callback();
+                redisClient.get(pendingPaymentKey, function(error, pending) {
+                    if (error || pending)
+                        return stopZalletPayments(error || new Error('Unreconciled payment already exists'), callback);
+                    callback();
+                });
+            },
             /*
                 Step 1 - build workers and rounds objects from redis
                          * removes duplicate block submissions from redis
@@ -648,11 +836,11 @@ function SetupForPool(logger, poolOptions, setupFinished){
                             return ['getblock', [r.blockHash]];
                         });
                         startRPCTimer();
-                        daemon.batchCmd(rpcDupCheck, function(error, blocks){
+                        miningDaemon.batchCmd(rpcDupCheck, function(error, blocks){
                             endRPCTimer();
                             if (error || !blocks) {
                                 logger.error(logSystem, logComponent, 'Error with duplicate block check rpc call getblock ' + JSON.stringify(error));
-                                return;
+                                return callback(true);
                             }
                             // look for the invalid duplicate block
                             var validBlocks = {}; // hashtable for unique look up
@@ -722,10 +910,14 @@ function SetupForPool(logger, poolOptions, setupFinished){
                 batchRPCcommand.push(['getaccount', [poolOptions.address]]);
 
                 startRPCTimer();
-                daemon.batchCmd(batchRPCcommand, function(error, txDetails){
+                var getTransactions = useZallet ? zalletTransactions : function(rounds, next) {
+                    daemon.batchCmd(batchRPCcommand, next);
+                };
+                getTransactions(rounds, function(error, txDetails){
                     endRPCTimer();
                     if (error || !txDetails){
-                        logger.error(logSystem, logComponent, 'Check finished - daemon rpc error with batch gettransactions ' + JSON.stringify(error));
+                        logger.error(logSystem, logComponent, 'Check finished - daemon rpc error with batch gettransactions ' +
+                            (error && error.message ? error.message : JSON.stringify(error)));
                         callback(true);
                         return;
                     }
@@ -795,17 +987,16 @@ function SetupForPool(logger, poolOptions, setupFinished){
                         // get transaction category for round
                         round.category = generationTx.category
 
-                        //Pay before daemon considers mature
-                        if (typeof poolOptions.coin.poolOptions.confirmations === 'undefined') {
-                            poolOptions.coin.poolOptions.confirmations = 100;
-                        }
-
-                        if (round.confirmations >= poolOptions.coin.poolOptions.confirmations) {
-                            round.category = 'generate';
-                        } else if (round.confirmations <= poolOptions.coin.poolOptions.confirmations) {
-                            round.category = 'immature';
-                        } else {
-                            round.category;
+                        if (!useZallet) {
+                            // Preserve the legacy zcashd maturity override.
+                            if (typeof poolOptions.coin.poolOptions.confirmations === 'undefined') {
+                                poolOptions.coin.poolOptions.confirmations = 100;
+                            }
+                            if (round.confirmations >= poolOptions.coin.poolOptions.confirmations) {
+                                round.category = 'generate';
+                            } else if (round.confirmations <= poolOptions.coin.poolOptions.confirmations) {
+                                round.category = 'immature';
+                            }
                         }
 
                         // get reward for newly generated blocks
@@ -926,6 +1117,7 @@ function SetupForPool(logger, poolOptions, setupFinished){
                             } else if (tBalance > totalOwed) {
                                 performPayment = true;
                             }
+                            if (useZallet) availableFunds = tBalance;
                             // just in case...
                             if (totalOwed <= 0) {
                                 performPayment = false;
@@ -1209,6 +1401,10 @@ function SetupForPool(logger, poolOptions, setupFinished){
                     for (var a in addressAmounts) {
                         addressAmounts[a] = coinsRound(addressAmounts[a]);
                     }
+                    if (useZallet && totalSent + coinsToSatoshies(fee) > availableFunds) {
+                        logger.warning(logSystem, logComponent, 'Waiting for pool-account funds including the fee reserve.');
+                        return callback(true);
+                    }
 
                     // POINT OF NO RETURN! GOOD LUCK!
                     // WE ARE SENDING PAYMENT CMD TO DAEMON
@@ -1217,7 +1413,14 @@ function SetupForPool(logger, poolOptions, setupFinished){
                     var rpccallTracking = 'sendmany "" '+JSON.stringify(addressAmounts);
                     //console.log(rpccallTracking);
 
-                    daemon.cmd('sendmany', ["", addressAmounts], function (result) {
+                    var sendPayment = useZallet ? function(done) {
+                        sendZallet(addressAmounts, workers, rounds, function(error, result) {
+                            done(error ? {error: {message: error.message}} : result);
+                        });
+                    } : function(done) {
+                        daemon.cmd('sendmany', ["", addressAmounts], done, true, true);
+                    };
+                    sendPayment(function (result) {
                         // check for failed payments, there are many reasons
                         if (result.error && result.error.code === -6) {
                             // check if it is because we don't have enough funds
@@ -1292,6 +1495,7 @@ function SetupForPool(logger, poolOptions, setupFinished){
 
                                 var paymentsUpdate = [];
                                 var paymentsData = {time:Date.now(), txid:txid, shares:totalShares, paid:satoshisToCoins(totalSent),  miners:Object.keys(addressAmounts).length, blocks: paymentBlocks, amounts: addressAmounts, balances: balanceAmounts, work:shareAmounts};
+                                if (useZallet) paymentsData.txids = result.txids;
                                 paymentsUpdate.push(['zadd', logComponent + ':payments', Date.now(), JSON.stringify(paymentsData)]);
 
                                 callback(null, workers, rounds, paymentsUpdate);
@@ -1307,7 +1511,7 @@ function SetupForPool(logger, poolOptions, setupFinished){
                                 return;
                             }
                         }
-                    }, true, true);
+                    });
                 };
 
                 // attempt to send any owed payments
@@ -1429,26 +1633,51 @@ function SetupForPool(logger, poolOptions, setupFinished){
                     return;
                 }
 
-                startRedisTimer();
-                redisClient.multi(finalRedisCommands).exec(function(error, results){
-                    endRedisTimer();
-                    if (error) {
-                        clearInterval(paymentInterval);
+                function commitAccounting() {
+                    startRedisTimer();
+                    redisClient.multi(finalRedisCommands).exec(function(error, results){
+                        endRedisTimer();
+                        if (useZallet && !error && (!results || results.some(function(result) { return result instanceof Error; })))
+                            error = new Error('Redis accounting command failed; inspect the pending payment journal');
+                        if (useZallet && error) return stopZalletPayments(error, callback);
+                        if (error) {
+                            clearInterval(paymentInterval);
 
-                        logger.error(logSystem, logComponent,
-                                'Payments sent but could not update redis. ' + JSON.stringify(error)
-                                + ' Disabling payment processing to prevent possible double-payouts. The redis commands in '
-                                + coin + '_finalRedisCommands.txt must be ran manually');
+                            logger.error(logSystem, logComponent,
+                                    'Payments sent but could not update redis. ' + JSON.stringify(error)
+                                    + ' Disabling payment processing to prevent possible double-payouts. The redis commands in '
+                                    + coin + '_finalRedisCommands.txt must be ran manually');
 
-                        fs.writeFile(coin + '_finalRedisCommands.txt', JSON.stringify(finalRedisCommands), function(err){
-                            logger.error('Could not write finalRedisCommands.txt, you are fucked.');
-                        });
-                    }
-                    callback();
-                });
+                            fs.writeFile(coin + '_finalRedisCommands.txt', JSON.stringify(finalRedisCommands), function(err){
+                                logger.error('Could not write finalRedisCommands.txt, you are fucked.');
+                            });
+                        }
+                        if (useZallet && pendingPayment && !error) {
+                            // Keep the fence through EXEC, including lost replies and per-command errors.
+                            return redisClient.del(pendingPaymentKey, function(error) {
+                                if (error) return stopZalletPayments(error, callback);
+                                pendingPayment = null;
+                                callback();
+                            });
+                        }
+                        callback(error);
+                    });
+                }
+                if (useZallet && pendingPayment) {
+                    pendingPayment.finalRedisCommands = finalRedisCommands;
+                    savePendingPayment(function(error) {
+                        if (error) return stopZalletPayments(error, callback);
+                        commitAccounting();
+                    });
+                } else {
+                    commitAccounting();
+                }
             }
 
-        ], function(){
+        ], function(error){
+            if (useZallet) paymentRunning = false;
+            if (useZallet && !error)
+                logger.debug(logSystem, logComponent, 'Zallet payment cycle completed');
 
             var paymentProcessTime = Date.now() - startPaymentProcess;
             logger.debug(logSystem, logComponent, 'Finished interval - time spent: '
@@ -1460,6 +1689,8 @@ function SetupForPool(logger, poolOptions, setupFinished){
 
 
     var getProperAddress = function(address){
+        // Zallet validates complete transparent/Sapling/Unified addresses; never redirect a payout.
+        if (useZallet) return address;
         if (address.length >= 40){
             logger.warning(logSystem, logComponent, 'Invalid address '+address+', convert to address '+(poolOptions.invalidAddress || poolOptions.address));
             return (poolOptions.invalidAddress || poolOptions.address);

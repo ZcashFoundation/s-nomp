@@ -1,0 +1,13 @@
+{
+    "name": "zcash_regtest",
+    "symbol": "zecr",
+    "algorithm": "equihash",
+    "hasGetInfo": true,
+    "vFundingStreams": false,
+    "payFoundersReward": false,
+    "requireShielding": true,
+    "parameters": {"N": 200, "K": 9, "personalization": "ZcashPoW"},
+    "txfee": 0.0004,
+    "poolOptions": {"confirmations": 100},
+    "_comment": "Zebra disable_pow Regtest with real 200,9 pool/miner solutions, not native 48,5 PoW consensus. Payout is Zebra [mining].miner_address."
+}
