@@ -1,0 +1,25 @@
+{
+    "name": "zcash_regtest",
+    "symbol": "zecr",
+    "algorithm": "equihash",
+    "overwinter": true,
+    "sapling": true,
+    "requireShielding": false,
+    "payFoundersReward": false,
+    "vFundingStreams": false,
+    "txfee": 0.0004,
+    "explorer": {
+        "txURL": "",
+        "blockURL": ""
+    },
+    "poolOptions": {
+        "confirmations": 1
+    },
+    "hasGetInfo": true,
+    "_comment_hasGetInfo": "required to use Zebra RPCs",
+    "parameters": {
+        "N": 48,
+        "K": 5,
+        "personalization": "ZcashPoW"
+    }
+}

@@ -21,6 +21,7 @@ RUN pacman -Syu --noconfirm && \
         gmp \
         redis \
         npm \
+        patch \
         pyenv
 
 # Install Python 3.10 via pyenv (compatible with old node-gyp)
