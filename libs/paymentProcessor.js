@@ -449,7 +449,7 @@ function SetupForPool(logger, poolOptions, setupFinished){
                     callback(true);
                 }
                 else {
-                    var opid = (result.response || result[0].response);
+                    var opid = (result.response || result[0].response).opid;
                     opidCount++;
                     opids.push(opid);
                     logger.special(logSystem, logComponent, 'Shielding balance ' + amount);
@@ -468,7 +468,10 @@ function SetupForPool(logger, poolOptions, setupFinished){
             logger.error(logSystem, logComponent, 'zBalance === NaN for sendZToT');
             return;
         }
-        if ((zBalance - 10000) <= 0)
+        // ZIP 317: two padded Sapling actions and one transparent output.
+        // Up to two Sapling spends; larger note batches need a higher fee.
+        var unshieldFee = 0.00015;
+        if ((zBalance - coinsToSatoshies(unshieldFee)) <= 0)
             return;
 
         // do not allow more than a single z_sendmany operation at a time
@@ -477,9 +480,10 @@ function SetupForPool(logger, poolOptions, setupFinished){
             return;
         }
 
-        var amount = satoshisToCoins(zBalance - 10000);
+        var amount = satoshisToCoins(zBalance - coinsToSatoshies(unshieldFee));
 
-        var params = [poolOptions.zAddress, [{'address': poolOptions.tAddress, 'amount': amount}]];
+        var params = [poolOptions.zAddress, [{'address': poolOptions.tAddress, 'amount': amount}],
+            minConfShield, unshieldFee, 'AllowRevealedRecipients'];
         daemon.cmd('z_sendmany', params,
             function (result) {
                 //Check if payments failed because wallet doesn't have enough coins to pay for tx fees
