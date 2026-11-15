@@ -10,7 +10,7 @@ not a coinbase override.
 Nonempty `rewardRecipients` and `poolHex` are rejected rather than silently
 ignored. Configure coinbase text at the daemon, not the pool. Miner distribution
 can use the [Zallet payment adapter](#zallet-payment-adapter); the matching
-stratum-pool branch permits `paymentProcessing.wallet = "zallet"`. Legacy zcashd
+stratum-pool revision permits `paymentProcessing.wallet = "zallet"`. Legacy zcashd
 payment processing remains available with the legacy pool implementation.
 See [the NU6.3 Regtest guide](#mine-on-nu63-regtest-with-zallet-payouts) below for
 the required branches; the older public-testnet setup follows first.
@@ -265,9 +265,9 @@ demonstrate successful mining or payouts.
 
 ### Source requirements
 
-- [s-nomp](https://github.com/ZcashFoundation/s-nomp), branch `feat/ironwood-nu6.3`.
-- [stratum-pool](https://github.com/upbqdn/node-stratum-pool), revision
-  `1f0726f5c3e3b0652a6e0ca0f9abb127c4828dcd`, including daemon-owned coinbases,
+- [s-nomp](https://github.com/ZcashFoundation/s-nomp), branch `zebra-mining`.
+- [stratum-pool](https://github.com/ZcashFoundation/node-stratum-pool), revision
+  `594aa324d6f1dc079c546bc099c39ea936958ce8`, including daemon-owned coinbases,
   external payments, long polling, and same-parent job updates.
 - [Zebra](https://github.com/ZcashFoundation/zebra), built from `main` with NU6.3
   Regtest activation, v6 block templates, and Ironwood coinbase support.
@@ -290,9 +290,9 @@ export STRATUM_SRC="$SRC_ROOT/node-stratum-pool"
 export ZEBRA_SRC="$SRC_ROOT/zebra"
 export ZALLET_SRC="$SRC_ROOT/wallet"
 export MINER_SRC="$SRC_ROOT/nheqminer"
-git clone --branch feat/ironwood-nu6.3 https://github.com/ZcashFoundation/s-nomp "$SNOMP_SRC"
-git clone --branch feat/ironwood-nu6.3 https://github.com/upbqdn/node-stratum-pool "$STRATUM_SRC"
-git -C "$STRATUM_SRC" checkout 1f0726f5c3e3b0652a6e0ca0f9abb127c4828dcd
+git clone --branch zebra-mining https://github.com/ZcashFoundation/s-nomp "$SNOMP_SRC"
+git clone --branch zebra-mining https://github.com/ZcashFoundation/node-stratum-pool "$STRATUM_SRC"
+git -C "$STRATUM_SRC" checkout 594aa324d6f1dc079c546bc099c39ea936958ce8
 git clone --branch main https://github.com/ZcashFoundation/zebra "$ZEBRA_SRC"
 git clone https://github.com/zcash/wallet "$ZALLET_SRC"
 git -C "$ZALLET_SRC" checkout "$ZALLET_REF"
@@ -330,39 +330,30 @@ coinbase construction. A NU6.3 v6 transaction starts
 is needed. Sources: `zebra-chain/src/parameters/{network_upgrade,transaction}.rs`,
 `zebra-rpc/src/methods/types/{transaction,default_roots,get_block_template}.rs`.
 
-### Install the pool branches
+### Install the pinned pool
 
 The legacy pool targets Node 8 (minimum 8.11); these commands use **8.17.0**.
-Prerequisites: npm, git, compiler/make, Boost.System, libsodium development files,
-GMP development files, Redis, curl and jq. Do not assume modern Node works with
-the old native verifier. Its `node-gyp` dependency also has newer runtime
-requirements, so check native-build compatibility when installing dependencies.
+Prerequisites: an x86-64 CPU with AVX and AES-NI (the pool always builds `verushash`),
+npm 6, Python 2.7, git, compiler/make, Boost.System, libsodium development files,
+Redis, curl and jq. The native verifier still requires an old Node runtime; the
+maintained pool pins Node 8-compatible `node-gyp` 5.0.5.
+Use the checked-in lockfiles rather than refreshing unrelated dependencies.
 
 ```sh
 nvm install 8.17.0
 nvm use 8.17.0
-export CXXFLAGS="-std=gnu++17"
+export CXXFLAGS="-std=gnu++1z"
+export npm_config_python=/usr/bin/python2
 cd "$STRATUM_SRC"
-npm install --unsafe-perm --package-lock=false
-node test/blockTemplate.js
+npm ci --unsafe-perm
+npm test
 cd "$SNOMP_SRC"
-npm install --unsafe-perm --no-save --package-lock=false "$STRATUM_SRC"
-node -p 'require.resolve("stratum-pool")'
+npm ci --unsafe-perm
 ```
 
-The final path must resolve to the pinned stratum-pool revision (or its
-npm-installed copy), not another branch or a previously installed dependency.
-Alternatively, install it directly from GitHub:
-
-```sh
-cd "$SNOMP_SRC"
-npm install --unsafe-perm --no-save --package-lock=false \
-  github:upbqdn/node-stratum-pool#1f0726f5c3e3b0652a6e0ca0f9abb127c4828dcd
-```
-
-These explicit installs leave the tracked dependency declaration and lockfile
-unchanged. Reapply the override after an ordinary `npm install`. `npm start`
-supplies the verifier library path.
+The portal's manifest and lockfile select the immutable Foundation revision; no local
+or GitHub override is required.
+`npm start` supplies the verifier library path.
 
 The checked-in regression vector is a hash/root excerpt of a height-114 Zebra
 NU5 block template with one Sapling and one transparent non-coinbase transaction.
@@ -735,4 +726,3 @@ a successful RPC operation alone is not proof of a completed payout.
 6. Submit a block with an incorrect Merkle root and require rejection. Replay a
    stale share and confirm it cannot create another accepted block. Keep the
    exact-root and transaction-inclusion checks enabled.
-
